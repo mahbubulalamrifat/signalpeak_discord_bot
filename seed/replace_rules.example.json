@@ -1,0 +1,10 @@
+[
+  {
+    "search_key": "unwanted text",
+    "replace_value": ""
+  },
+  {
+    "search_key": "VIP SIGNAL",
+    "replace_value": "SIGNAL"
+  }
+]
