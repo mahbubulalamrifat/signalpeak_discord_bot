@@ -8,14 +8,12 @@ from dataclasses import dataclass
 import logging
 
 import discord
-from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.constants import EventType
-from app.database import SessionLocal
-from app.models import DiscordRoute
 from app.services.activity_log import write_log
 from app.services.route_cache import refresh_route_cache
+from app.services.signalpeak_api import api_configured, get_json, post_json
 
 logger = logging.getLogger("signalpeak.channels")
 
@@ -77,52 +75,33 @@ async def sync_channels_if_empty(client: discord.Client) -> int:
         logger.error("Set SOURCE_SERVER_ID and DESTINATION_SERVER_ID before the first channel mapping.")
         return 0
 
-    async with SessionLocal() as session:
-        existing = await session.scalar(select(func.count()).select_from(DiscordRoute))
-        if existing:
-            logger.info("signalpeak_discord already has %s route(s). Existing pairs were left as they are.", existing)
-            return 0
+    if await _pairs_already_saved():
+        return 0
 
-        try:
-            source_guild, source_slots = await _text_channels(client, source_id)
-            destination_guild, destination_slots = await _text_channels(client, destination_id)
-        except discord.HTTPException as exc:
-            detail = (
-                f"Could not read channels for source {source_id} or destination {destination_id}. "
-                f"The bot must be a member of both servers. Discord said: {exc}"
-            )
-            logger.error(detail)
-            await write_log(session, event_type=EventType.CHANNELS_MAPPED, level="error", detail=detail)
-            await session.commit()
-            return 0
-
-        pairs, missing_on_destination, missing_on_source = pair_channels(source_slots, destination_slots)
-        for pair in pairs:
-            session.add(
-                DiscordRoute(
-                    source_server_id=source_guild.id,
-                    source_server_name=source_guild.name[:255],
-                    source_category_id=pair.source.category_id,
-                    source_category_name=_clip(pair.source.category_name),
-                    source_channel_id=pair.source.channel_id,
-                    source_channel_name=pair.source.channel_name[:255],
-                    destination_server_id=destination_guild.id,
-                    destination_server_name=destination_guild.name[:255],
-                    destination_category_id=pair.destination.category_id,
-                    destination_category_name=_clip(pair.destination.category_name),
-                    destination_channel_id=pair.destination.channel_id,
-                    destination_channel_name=pair.destination.channel_name[:255],
-                    is_active=True,
-                )
-            )
-
+    try:
+        source_guild, source_slots = await _text_channels(client, source_id)
+        destination_guild, destination_slots = await _text_channels(client, destination_id)
+    except discord.HTTPException as exc:
         detail = (
-            f"Mapped {len(pairs)} text channel(s) from {source_guild.name} to {destination_guild.name}. "
-            f"{len(missing_on_destination)} source channel(s) had no destination match. "
-            f"{len(missing_on_source)} destination channel(s) had no source match."
+            f"Could not read channels for source {source_id} or destination {destination_id}. "
+            f"The bot must be a member of both servers. Discord said: {exc}"
         )
-        await write_log(
-            session,
+        logger.error(detail)
+        await write_log(event_type=EventType.CHANNELS_MAPPED, level="error", detail=detail)
+        return 0
+
+    pairs, missing_on_destination, missing_on_source = pair_channels(source_slots, destination_slots)
+    saved_through_api = await _save_pairs_through_api(source_guild, destination_guild, pairs)
+    if not saved_through_api:
+        logger.error("Channel pairs were not saved. SIGNALPEAK_API_URL must point at the SignalPeak API.")
+        return 0
+
+    detail = (
+        f"Mapped {len(pairs)} text channel(s) from {source_guild.name} to {destination_guild.name}. "
+        f"{len(missing_on_destination)} source channel(s) had no destination match. "
+        f"{len(missing_on_source)} destination channel(s) had no source match."
+    )
+    await write_log(
             event_type=EventType.CHANNELS_MAPPED,
             detail=detail,
             source_server_id=source_guild.id,
@@ -131,14 +110,61 @@ async def sync_channels_if_empty(client: discord.Client) -> int:
             destination_server_name=destination_guild.name,
             extra={
                 "mapped": len(pairs),
+                "saved_through_api": saved_through_api,
                 "source_only": [_label(slot) for slot in missing_on_destination[:50]],
                 "destination_only": [_label(slot) for slot in missing_on_source[:50]],
             },
         )
-        await session.commit()
-        await refresh_route_cache()
-        logger.info(detail)
-        return len(pairs)
+    await refresh_route_cache()
+    logger.info(detail)
+    return len(pairs)
+
+
+async def _pairs_already_saved() -> bool:
+    if api_configured():
+        try:
+            payload = await get_json("/discord/routes")
+            count = len(payload.get("routes", []))
+            if count:
+                logger.info("The API already has %s channel pair(s). Mapping was not repeated.", count)
+                return True
+            return False
+        except Exception:
+            logger.exception("Could not ask the API for existing channel pairs.")
+            return False
+    logger.error("SIGNALPEAK_API_URL is empty, so existing channel pairs could not be checked.")
+    return False
+
+
+async def _save_pairs_through_api(source_guild: discord.Guild, destination_guild: discord.Guild, pairs: list[ChannelPair]) -> bool:
+    if not api_configured():
+        return False
+    payload = {
+        "routes": [
+            {
+                "source_server_id": source_guild.id,
+                "source_server_name": source_guild.name[:255],
+                "source_category_id": pair.source.category_id,
+                "source_category_name": _clip(pair.source.category_name),
+                "source_channel_id": pair.source.channel_id,
+                "source_channel_name": pair.source.channel_name[:255],
+                "destination_server_id": destination_guild.id,
+                "destination_server_name": destination_guild.name[:255],
+                "destination_category_id": pair.destination.category_id,
+                "destination_category_name": _clip(pair.destination.category_name),
+                "destination_channel_id": pair.destination.channel_id,
+                "destination_channel_name": pair.destination.channel_name[:255],
+                "is_active": True,
+            }
+            for pair in pairs
+        ]
+    }
+    try:
+        result = await post_json("/discord/routes/sync", payload)
+    except Exception:
+        return False
+    logger.info("API stored %s new channel pair(s)", result.get("created", 0))
+    return True
 
 
 async def _text_channels(client: discord.Client, server_id: int) -> tuple[discord.Guild, list[ChannelSlot]]:

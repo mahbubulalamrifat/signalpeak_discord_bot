@@ -5,13 +5,13 @@ import logging
 import discord
 
 from app.constants import EventType
-from app.database import SessionLocal
 from app.services.activity_log import write_log
 from app.services.bot_client import bot
 from app.services.channel_sync import sync_channels_if_empty
 from app.services.forwarder import handle_incoming_message
 from app.services.members import process_pending_member_actions
-from app.services.routes import refresh_route_names, tracked_guild_ids
+from app.services.route_cache import tracked_server_ids
+from app.services.routes import refresh_route_names
 
 logger = logging.getLogger("signalpeak.bot")
 
@@ -19,15 +19,12 @@ logger = logging.getLogger("signalpeak.bot")
 @bot.event
 async def on_ready() -> None:
     logger.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
-    async with SessionLocal() as session:
-        await write_log(
-            session,
-            event_type=EventType.BOT_READY,
+    await write_log(
+        event_type=EventType.BOT_READY,
             detail=f"Bot connected as {bot.user}",
             actor_id=bot.user.id if bot.user else None,
             actor_name=str(bot.user) if bot.user else None,
-        )
-        await session.commit()
+    )
     try:
         mapped = await sync_channels_if_empty(bot)
         logger.info("Initial channel mapping saved %s route(s)", mapped)
@@ -135,10 +132,8 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
     else:
         detail += ". Deleter was not available in the audit log."
 
-    async with SessionLocal() as session:
-        await write_log(
-            session,
-            event_type=EventType.MESSAGE_DELETED,
+    await write_log(
+        event_type=EventType.MESSAGE_DELETED,
             detail=detail,
             actor_id=deleter_id or author_id,
             actor_name=deleter_name or author_name,
@@ -154,7 +149,6 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
                 "deleter_name": deleter_name,
             },
         )
-        await session.commit()
 
 
 async def _log_guild_member(
@@ -167,9 +161,7 @@ async def _log_guild_member(
 ) -> None:
     if not await _is_tracked(guild.id):
         return
-    async with SessionLocal() as session:
-        await write_log(
-            session,
+    await write_log(
             event_type=event_type,
             detail=detail,
             actor_id=actor_id,
@@ -178,12 +170,10 @@ async def _log_guild_member(
             source_server_name=guild.name,
             extra=extra,
         )
-        await session.commit()
 
 
 async def _is_tracked(guild_id: int) -> bool:
-    async with SessionLocal() as session:
-        return guild_id in await tracked_guild_ids(session)
+    return guild_id in await tracked_server_ids()
 
 
 async def _moderator(guild: discord.Guild, action: discord.AuditLogAction, target_id: int) -> tuple[int | None, str | None]:

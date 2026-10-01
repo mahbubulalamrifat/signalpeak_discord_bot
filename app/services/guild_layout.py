@@ -4,15 +4,13 @@ import logging
 
 import discord
 from fastapi import HTTPException
-from sqlalchemy import or_, select
 
 from app.config import get_settings
 from app.constants import EventType
-from app.database import SessionLocal
-from app.models import DiscordRoute
 from app.services.activity_log import write_log
 from app.services.bot_client import bot
-from app.services.route_cache import refresh_route_cache
+from app.services.route_cache import all_routes
+from app.services.signalpeak_api import patch_json
 
 logger = logging.getLogger("signalpeak.layout")
 
@@ -226,52 +224,34 @@ async def _remember_channel(server_id: int, channel: discord.TextChannel) -> Non
     category = channel.category
     category_id = None if category is None else category.id
     category_name = None if category is None else category.name[:255]
-    async with SessionLocal() as session:
-        routes = list(
-            (
-                await session.scalars(
-                    select(DiscordRoute).where(
-                        or_(
-                            (DiscordRoute.source_server_id == server_id) & (DiscordRoute.source_channel_id == channel.id),
-                            (DiscordRoute.destination_server_id == server_id) & (DiscordRoute.destination_channel_id == channel.id),
-                        )
-                    )
-                )
-            ).all()
-        )
-        for route in routes:
-            if route.source_server_id == server_id and route.source_channel_id == channel.id:
-                route.source_channel_name = channel.name[:255]
-                route.source_category_id = category_id
-                route.source_category_name = category_name
-            if route.destination_server_id == server_id and route.destination_channel_id == channel.id:
-                route.destination_channel_name = channel.name[:255]
-                route.destination_category_id = category_id
-                route.destination_category_name = category_name
-        await session.commit()
+    for route in await all_routes():
+        if route.source_server_id == server_id and route.source_channel_id == channel.id:
+            await patch_json(
+                f"/discord/routes/{route.id}",
+                {
+                    "source_channel_name": channel.name[:255],
+                    "source_category_id": category_id,
+                    "source_category_name": category_name,
+                },
+            )
+        if route.destination_server_id == server_id and route.destination_channel_id == channel.id:
+            await patch_json(
+                f"/discord/routes/{route.id}",
+                {
+                    "destination_channel_name": channel.name[:255],
+                    "destination_category_id": category_id,
+                    "destination_category_name": category_name,
+                },
+            )
 
 
 async def _remember_category_name(server_id: int, category_id: int, name: str) -> None:
     stored = name[:255]
-    async with SessionLocal() as session:
-        routes = list(
-            (
-                await session.scalars(
-                    select(DiscordRoute).where(
-                        or_(
-                            (DiscordRoute.source_server_id == server_id) & (DiscordRoute.source_category_id == category_id),
-                            (DiscordRoute.destination_server_id == server_id) & (DiscordRoute.destination_category_id == category_id),
-                        )
-                    )
-                )
-            ).all()
-        )
-        for route in routes:
-            if route.source_server_id == server_id and route.source_category_id == category_id:
-                route.source_category_name = stored
-            if route.destination_server_id == server_id and route.destination_category_id == category_id:
-                route.destination_category_name = stored
-        await session.commit()
+    for route in await all_routes():
+        if route.source_server_id == server_id:
+            await patch_json(f"/discord/routes/{route.id}", {"source_category_name": stored})
+        if route.destination_server_id == server_id:
+            await patch_json(f"/discord/routes/{route.id}", {"destination_category_name": stored})
 
 
 async def _log_layout(
@@ -305,6 +285,4 @@ async def _log_layout(
         fields["source_server_name"] = guild.name
         fields["source_channel_id"] = channel_id
         fields["source_channel_name"] = channel_name
-    async with SessionLocal() as session:
-        await write_log(session, **fields)
-        await session.commit()
+    await write_log(**fields)

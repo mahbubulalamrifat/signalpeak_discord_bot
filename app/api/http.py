@@ -1,113 +1,53 @@
-"""Management API. Forwarding itself reads the database; these endpoints maintain that data."""
+"""Management API. Stored data is read and written through the SignalPeak API."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_admin
 from app.constants import MemberActionName
-from app.database import get_session
-from app.models import ActivityLog, DiscordRoute, MemberAction, ReplaceRule
-from app.schemas import (
-    LogOut,
-    MemberActionIn,
-    MemberActionOut,
-    ReplaceRuleBulk,
-    ReplaceRuleIn,
-    ReplaceRuleOut,
-    ReplaceRuleUpdate,
-    RouteIn,
-    RouteOut,
-    RouteUpdate,
-)
+from app.schemas import MemberActionIn, ReplaceRuleBulk, ReplaceRuleIn, ReplaceRuleUpdate, RouteIn, RouteUpdate
 from app.services.bot_client import bot
 from app.services.members import process_pending_member_actions, queue_member_action
 from app.services.replace_cache import refresh_replace_rules
 from app.services.route_cache import refresh_route_cache
 from app.services.routes import refresh_route_names
+from app.services.signalpeak_api import SignalPeakApiError, delete_json, get_json, patch_json, post_json
 
 router = APIRouter(prefix="/api", tags=["signalpeak"], dependencies=[Depends(require_admin)])
 
 
-@router.get("/routes", response_model=list[RouteOut])
-async def list_routes(session: AsyncSession = Depends(get_session)) -> list[DiscordRoute]:
-    rows = await session.scalars(select(DiscordRoute).order_by(DiscordRoute.id.asc()))
-    return list(rows.all())
+@router.get("/routes")
+async def list_routes() -> dict:
+    return await get_json("/discord/routes")
 
 
-@router.post("/routes", response_model=RouteOut, status_code=201)
-async def create_route(body: RouteIn, session: AsyncSession = Depends(get_session)) -> DiscordRoute:
+@router.post("/routes", status_code=201)
+async def create_route(body: RouteIn) -> dict:
     if body.source_channel_id == body.destination_channel_id:
         raise HTTPException(status_code=400, detail="Source and destination channel must be different")
-    names = (
-        body.source_server_name,
-        body.source_channel_name,
-        body.destination_server_name,
-        body.destination_channel_name,
-    )
-    if any(not name.strip() for name in names):
-        raise HTTPException(status_code=400, detail="Server and channel names cannot be blank")
-    route = DiscordRoute(
-        source_server_id=int(body.source_server_id),
-        source_server_name=body.source_server_name.strip(),
-        source_category_id=int(body.source_category_id) if body.source_category_id else None,
-        source_category_name=body.source_category_name.strip() if body.source_category_name else None,
-        source_channel_id=int(body.source_channel_id),
-        source_channel_name=body.source_channel_name.strip(),
-        destination_server_id=int(body.destination_server_id),
-        destination_server_name=body.destination_server_name.strip(),
-        destination_category_id=int(body.destination_category_id) if body.destination_category_id else None,
-        destination_category_name=body.destination_category_name.strip() if body.destination_category_name else None,
-        destination_channel_id=int(body.destination_channel_id),
-        destination_channel_name=body.destination_channel_name.strip(),
-        is_active=body.is_active,
-    )
-    session.add(route)
     try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        raise HTTPException(status_code=409, detail="That source and destination channel pair already exists") from None
-    await session.refresh(route)
+        saved = await post_json("/discord/routes", body.model_dump())
+    except SignalPeakApiError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     await refresh_route_cache()
-    return route
+    return saved
 
 
-@router.patch("/routes/{route_id}", response_model=RouteOut)
-async def update_route(route_id: int, body: RouteUpdate, session: AsyncSession = Depends(get_session)) -> DiscordRoute:
-    route = await session.get(DiscordRoute, route_id)
-    if route is None:
-        raise HTTPException(status_code=404, detail="Route not found")
-    id_fields = {
-        "source_server_id",
-        "source_channel_id",
-        "destination_server_id",
-        "destination_channel_id",
-    }
-    for field, value in body.model_dump(exclude_unset=True).items():
-        if field in id_fields and value is not None:
-            value = int(value)
-        setattr(route, field, value)
-    if route.source_channel_id == route.destination_channel_id:
-        raise HTTPException(status_code=400, detail="Source and destination channel must be different")
+@router.patch("/routes/{route_id}")
+async def update_route(route_id: int, body: RouteUpdate) -> dict:
     try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        raise HTTPException(status_code=409, detail="That source and destination channel pair already exists") from None
-    await session.refresh(route)
+        saved = await patch_json(f"/discord/routes/{route_id}", body.model_dump(exclude_unset=True))
+    except SignalPeakApiError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     await refresh_route_cache()
-    return route
+    return saved
 
 
 @router.delete("/routes/{route_id}", status_code=204)
-async def delete_route(route_id: int, session: AsyncSession = Depends(get_session)) -> None:
-    route = await session.get(DiscordRoute, route_id)
-    if route is None:
-        raise HTTPException(status_code=404, detail="Route not found")
-    await session.delete(route)
-    await session.commit()
+async def delete_route(route_id: int) -> None:
+    try:
+        await delete_json(f"/discord/routes/{route_id}")
+    except SignalPeakApiError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     await refresh_route_cache()
 
 
@@ -119,117 +59,98 @@ async def refresh_names() -> dict:
     return {"updated_fields": updated}
 
 
-@router.get("/replace-rules", response_model=list[ReplaceRuleOut])
-async def list_replace_rules(session: AsyncSession = Depends(get_session)) -> list[ReplaceRule]:
-    rows = await session.scalars(select(ReplaceRule).order_by(ReplaceRule.id.asc()))
-    return list(rows.all())
-
-
-@router.post("/replace-rules", response_model=ReplaceRuleOut, status_code=201)
-async def create_replace_rule(body: ReplaceRuleIn, session: AsyncSession = Depends(get_session)) -> ReplaceRule:
-    rule = _rule_from_input(body)
-    session.add(rule)
-    await session.commit()
-    await session.refresh(rule)
+@router.post("/cache/refresh")
+async def refresh_cache() -> dict:
     await refresh_replace_rules()
-    return rule
+    await refresh_route_cache()
+    return {"ok": True}
 
 
-@router.post("/replace-rules/bulk", response_model=list[ReplaceRuleOut], status_code=201)
-async def create_replace_rules(body: ReplaceRuleBulk, session: AsyncSession = Depends(get_session)) -> list[ReplaceRule]:
-    created: list[ReplaceRule] = []
+@router.get("/replace-rules")
+async def list_replace_rules() -> dict:
+    return await get_json("/discord/replace-rules")
+
+
+@router.post("/replace-rules", status_code=201)
+async def create_replace_rule(body: ReplaceRuleIn) -> dict:
+    saved = await post_json(
+        "/discord/replace-rules",
+        {"search_key": body.search_key, "replace_value": body.replace_value or ""},
+    )
+    await refresh_replace_rules()
+    return saved
+
+
+@router.post("/replace-rules/bulk", status_code=201)
+async def create_replace_rules(body: ReplaceRuleBulk) -> list[dict]:
+    created = []
     for item in body.rules:
-        rule = _rule_from_input(item)
-        session.add(rule)
-        created.append(rule)
-    await session.commit()
-    for rule in created:
-        await session.refresh(rule)
+        created.append(
+            await post_json(
+                "/discord/replace-rules",
+                {"search_key": item.search_key, "replace_value": item.replace_value or ""},
+            )
+        )
     await refresh_replace_rules()
     return created
 
 
-@router.patch("/replace-rules/{rule_id}", response_model=ReplaceRuleOut)
-async def update_replace_rule(
-    rule_id: int,
-    body: ReplaceRuleUpdate,
-    session: AsyncSession = Depends(get_session),
-) -> ReplaceRule:
-    rule = await session.get(ReplaceRule, rule_id)
-    if rule is None:
-        raise HTTPException(status_code=404, detail="Replace rule not found")
+@router.patch("/replace-rules/{rule_id}")
+async def update_replace_rule(rule_id: int, body: ReplaceRuleUpdate) -> dict:
     changes = body.model_dump(exclude_unset=True)
     if "search_key" not in changes and "key" in changes:
-        changes["search_key"] = changes["key"]
+        changes["search_key"] = changes.pop("key")
+    else:
+        changes.pop("key", None)
     if "replace_value" not in changes and "value" in changes:
-        changes["replace_value"] = changes["value"]
-    changes.pop("key", None)
-    changes.pop("value", None)
-    if "search_key" in changes and not str(changes["search_key"]).strip():
-        raise HTTPException(status_code=400, detail="search_key cannot be empty")
-    for field, value in changes.items():
-        setattr(rule, field, value)
-    await session.commit()
-    await session.refresh(rule)
+        changes["replace_value"] = changes.pop("value")
+    else:
+        changes.pop("value", None)
+    saved = await patch_json(f"/discord/replace-rules/{rule_id}", changes)
     await refresh_replace_rules()
-    return rule
+    return saved
 
 
 @router.delete("/replace-rules/{rule_id}", status_code=204)
-async def delete_replace_rule(rule_id: int, session: AsyncSession = Depends(get_session)) -> None:
-    rule = await session.get(ReplaceRule, rule_id)
-    if rule is None:
-        raise HTTPException(status_code=404, detail="Replace rule not found")
-    await session.delete(rule)
-    await session.commit()
+async def delete_replace_rule(rule_id: int) -> None:
+    await delete_json(f"/discord/replace-rules/{rule_id}")
     await refresh_replace_rules()
 
 
-@router.get("/logs", response_model=list[LogOut])
+@router.get("/logs")
 async def list_logs(
     event_type: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    session: AsyncSession = Depends(get_session),
-) -> list[ActivityLog]:
-    query = select(ActivityLog).order_by(ActivityLog.id.desc()).offset(offset).limit(limit)
-    if event_type:
-        query = query.where(ActivityLog.event_type == event_type)
-    rows = await session.scalars(query)
-    return list(rows.all())
+) -> dict:
+    return {"message": "Read logs from the SignalPeak API database."}
 
 
-@router.get("/members/actions", response_model=list[MemberActionOut])
-async def list_member_actions(
-    status: str | None = None,
-    limit: int = Query(default=100, ge=1, le=500),
-    session: AsyncSession = Depends(get_session),
-) -> list[MemberAction]:
-    query = select(MemberAction).order_by(MemberAction.id.desc()).limit(limit)
+@router.get("/members/actions")
+async def list_member_actions(status: str | None = None) -> dict:
+    path = "/discord/member-actions"
     if status:
-        query = query.where(MemberAction.status == status)
-    rows = await session.scalars(query)
-    return list(rows.all())
+        path += f"?status={status}"
+    return await get_json(path)
 
 
-@router.post("/members/approve", response_model=MemberActionOut)
-async def approve_member(body: MemberActionIn, session: AsyncSession = Depends(get_session)) -> MemberAction:
-    return await _queue_and_run(session, MemberActionName.APPROVE, body)
+@router.post("/members/approve")
+async def approve_member(body: MemberActionIn) -> dict:
+    return await _queue_and_run(MemberActionName.APPROVE, body)
 
 
-@router.post("/members/kick", response_model=MemberActionOut)
-async def kick_member(body: MemberActionIn, session: AsyncSession = Depends(get_session)) -> MemberAction:
-    return await _queue_and_run(session, MemberActionName.KICK, body)
+@router.post("/members/kick")
+async def kick_member(body: MemberActionIn) -> dict:
+    return await _queue_and_run(MemberActionName.KICK, body)
 
 
-@router.post("/members/ban", response_model=MemberActionOut)
-async def ban_member(body: MemberActionIn, session: AsyncSession = Depends(get_session)) -> MemberAction:
-    return await _queue_and_run(session, MemberActionName.BAN, body)
+@router.post("/members/ban")
+async def ban_member(body: MemberActionIn) -> dict:
+    return await _queue_and_run(MemberActionName.BAN, body)
 
 
-async def _queue_and_run(session: AsyncSession, action: str, body: MemberActionIn) -> MemberAction:
+async def _queue_and_run(action: str, body: MemberActionIn) -> dict:
     row = await queue_member_action(
-        session,
         action=action,
         server_id=int(body.server_id),
         user_id=int(body.user_id),
@@ -239,12 +160,13 @@ async def _queue_and_run(session: AsyncSession, action: str, body: MemberActionI
         server_name=body.server_name,
     )
     await process_pending_member_actions(bot)
-    await session.refresh(row)
-    return row
-
-
-def _rule_from_input(body: ReplaceRuleIn) -> ReplaceRule:
-    return ReplaceRule(
-        search_key=str(body.search_key),
-        replace_value="" if body.replace_value is None else body.replace_value,
-    )
+    return {
+        "id": row.id,
+        "action": row.action,
+        "server_id": str(row.server_id),
+        "user_id": str(row.user_id),
+        "status": row.status,
+        "username": row.username,
+        "server_name": row.server_name,
+        "error_message": row.error_message,
+    }

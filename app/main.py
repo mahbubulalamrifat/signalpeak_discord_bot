@@ -11,10 +11,8 @@ from app.api.discord import router as discord_router
 from app.api.http import router
 from app.bot import bot
 from app.config import get_settings
-from app.database import SessionLocal, check_db, init_db
 from app.services.replace_cache import refresh_replace_rules
 from app.services.route_cache import refresh_route_cache
-from app.services.seed import seed_initial_data
 
 logger = logging.getLogger("signalpeak")
 
@@ -38,9 +36,6 @@ async def lifespan(app: FastAPI):
     if not settings.discord_public_key.strip():
         logger.warning("DISCORD_PUBLIC_KEY is empty.")
 
-    await init_db()
-    async with SessionLocal() as session:
-        await seed_initial_data(session)
     await refresh_replace_rules()
     await refresh_route_cache()
 
@@ -89,20 +84,12 @@ app.include_router(discord_router)
 @app.get("/health")
 async def health() -> dict:
     settings = get_settings()
-    database_ok = True
-    database_error = None
-    try:
-        await check_db()
-    except Exception as exc:
-        database_ok = False
-        database_error = str(exc)
     return {
-        "ok": database_ok and bot.is_ready(),
-        "database": database_ok,
-        "database_error": database_error,
+        "ok": bot.is_ready(),
         "bot_connected": bot.is_ready(),
         "application_id": settings.discord_application_id or None,
         "public_key_configured": bool(settings.discord_public_key.strip()),
+        "api_url": settings.signalpeak_api_url or None,
     }
 
 
