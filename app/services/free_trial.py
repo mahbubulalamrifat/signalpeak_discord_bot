@@ -1,12 +1,10 @@
 """Destination-server join options. Only the one-day free trial is active."""
 
-import asyncio
 import logging
 
 import discord
 
 from app.config import get_settings
-from app.services.bot_client import bot
 from app.services.signalpeak_api import get_json, post_json
 
 logger = logging.getLogger("signalpeak.free_trial")
@@ -16,8 +14,6 @@ FREE_TRIAL = "join_plan:free_trial"
 MONTHLY = "join_plan:monthly"
 LIFETIME = "join_plan:lifetime"
 EMAIL_MODAL = "join_plan:free_trial_email"
-
-_expiry_task: asyncio.Task | None = None
 
 
 async def enforce_join(member: discord.Member) -> None:
@@ -53,13 +49,6 @@ async def handle_interaction(interaction: discord.Interaction) -> None:
         return
     if custom_id == EMAIL_MODAL:
         await _start_trial(interaction)
-
-
-def start_expiry_loop() -> None:
-    global _expiry_task
-    if _expiry_task is not None and not _expiry_task.done():
-        return
-    _expiry_task = asyncio.create_task(_expire_loop())
 
 
 async def _offer_plans(member: discord.Member) -> None:
@@ -111,35 +100,6 @@ def _modal_value(interaction: discord.Interaction, custom_id: str) -> str:
             if component.get("custom_id") == custom_id:
                 return str(component.get("value", "")).strip()
     return ""
-
-
-async def _expire_loop() -> None:
-    while True:
-        await asyncio.sleep(60)
-        await expire_due_trials()
-
-
-async def expire_due_trials() -> None:
-    destination_id = settings.destination_server_snowflake
-    if destination_id is None or not bot.is_ready():
-        return
-    try:
-        payload = await get_json("/discord/free-trials?due=1")
-    except Exception:
-        return
-    guild = bot.get_guild(destination_id)
-    if guild is None:
-        return
-    for trial in payload.get("free_trials", []):
-        user_id = int(trial["discord_user_id"])
-        await _remove(guild, user_id, "Free trial ended")
-        try:
-            await post_json(
-                f"/discord/free-trials/{trial['id']}/kick",
-                {"already_removed": True, "status": "expired", "reason": "Free trial ended"},
-            )
-        except Exception:
-            logger.exception("Could not mark free trial %s expired", trial.get("id"))
 
 
 async def _remove(guild: discord.Guild, user_id: int, reason: str) -> None:
