@@ -24,6 +24,7 @@ def setup_logging() -> None:
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
     logging.getLogger("discord").setLevel(logging.WARNING)
     logging.getLogger("discord.http").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 
 @asynccontextmanager

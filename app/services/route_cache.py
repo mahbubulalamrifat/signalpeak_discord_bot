@@ -62,7 +62,6 @@ async def refresh_route_cache() -> _RouteCache:
     async with _lock:
         loaded = await _load()
         _cache = loaded
-        logger.info("Destination cache now has %s active channel pair(s)", sum(len(rows) for rows in loaded.by_source.values()))
         return loaded
 
 

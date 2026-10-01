@@ -32,7 +32,6 @@ async def refresh_replace_rules() -> tuple[ReplacementRule, ...]:
                     )
                     for item in payload.get("replace_rules", [])
                 )
-                logger.info("Replace rules cache now has %s rule(s) from the API", len(_rules))
                 return _rules
             except Exception:
                 logger.exception("Could not load replace rules from the SignalPeak API.")

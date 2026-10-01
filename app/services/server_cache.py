@@ -43,7 +43,6 @@ async def refresh_server_pair() -> ServerPair | None:
         source_server_name=payload.get("source_server_name"),
         destination_server_name=payload.get("destination_server_name"),
     )
-    logger.info("Loaded source %s and destination %s from the database.", source_id, destination_id)
     return _pair
 
 
