@@ -4,11 +4,10 @@ import logging
 
 import discord
 
-from app.config import get_settings
+from app.services.server_cache import server_pair
 from app.services.signalpeak_api import get_json, post_json
 
 logger = logging.getLogger("signalpeak.free_trial")
-settings = get_settings()
 
 FREE_TRIAL = "join_plan:free_trial"
 MONTHLY = "join_plan:monthly"
@@ -19,7 +18,8 @@ EMAIL_MODAL = "join_plan:free_trial_email"
 async def enforce_join(member: discord.Member) -> None:
     """Kick a returning member whose free trial is already used. Offer plans otherwise."""
 
-    destination_id = settings.destination_server_snowflake
+    pair = server_pair()
+    destination_id = pair.destination_server_id if pair else None
     if destination_id is None or member.guild.id != destination_id:
         return
 
@@ -73,7 +73,8 @@ async def _start_trial(interaction: discord.Interaction) -> None:
     if not email or "@" not in email:
         await interaction.response.send_message("Enter a valid email to start the free trial.", ephemeral=True)
         return
-    destination_id = settings.destination_server_snowflake
+    pair = server_pair()
+    destination_id = pair.destination_server_id if pair else None
     if destination_id is None:
         await interaction.response.send_message("The destination server is not configured.", ephemeral=True)
         return

@@ -22,22 +22,12 @@ class Settings(BaseSettings):
     approval_role_id: str = ""
     log_unmatched_messages: bool = False
     log_level: str = "INFO"
-    source_server_id: str = ""
-    destination_server_id: str = ""
     signalpeak_api_url: str = ""
     signalpeak_api_token: str = ""
 
     @property
     def approval_role_snowflake(self) -> int | None:
         return _snowflake(self.approval_role_id)
-
-    @property
-    def source_server_snowflake(self) -> int | None:
-        return _snowflake(self.source_server_id)
-
-    @property
-    def destination_server_snowflake(self) -> int | None:
-        return _snowflake(self.destination_server_id)
 
 
 def _snowflake(value: str) -> int | None:

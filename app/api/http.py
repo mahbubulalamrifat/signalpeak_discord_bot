@@ -9,6 +9,7 @@ from app.services.bot_client import bot
 from app.services.members import process_pending_member_actions, queue_member_action
 from app.services.replace_cache import refresh_replace_rules
 from app.services.route_cache import refresh_route_cache
+from app.services.server_cache import refresh_server_pair
 from app.services.routes import refresh_route_names
 from app.services.signalpeak_api import SignalPeakApiError, delete_json, get_json, patch_json, post_json
 
@@ -63,6 +64,7 @@ async def refresh_names() -> dict:
 async def refresh_cache() -> dict:
     await refresh_replace_rules()
     await refresh_route_cache()
+    await refresh_server_pair()
     return {"ok": True}
 
 

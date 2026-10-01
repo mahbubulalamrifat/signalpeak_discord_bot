@@ -5,11 +5,11 @@ import logging
 import discord
 from fastapi import HTTPException
 
-from app.config import get_settings
 from app.constants import EventType
 from app.services.activity_log import write_log
 from app.services.bot_client import bot
 from app.services.route_cache import all_routes
+from app.services.server_cache import server_pair
 from app.services.signalpeak_api import patch_json
 
 logger = logging.getLogger("signalpeak.layout")
@@ -22,7 +22,8 @@ def require_connected_bot() -> None:
 
 async def load_guild(server_id: int | None) -> discord.Guild:
     require_connected_bot()
-    target = server_id or get_settings().destination_server_snowflake
+    pair = server_pair()
+    target = server_id or (pair.destination_server_id if pair else None)
     if target is None:
         raise HTTPException(status_code=400, detail="server_id is required")
     try:
@@ -264,7 +265,7 @@ async def _log_layout(
     category_id: int | None = None,
     category_name: str | None = None,
 ) -> None:
-    settings = get_settings()
+    pair = server_pair()
     fields: dict = {
         "event_type": event_type,
         "detail": detail,
@@ -275,7 +276,7 @@ async def _log_layout(
             "channel_name": channel_name,
         },
     }
-    if settings.destination_server_snowflake == guild.id:
+    if pair is not None and pair.destination_server_id == guild.id:
         fields["destination_server_id"] = guild.id
         fields["destination_server_name"] = guild.name
         fields["destination_channel_id"] = channel_id

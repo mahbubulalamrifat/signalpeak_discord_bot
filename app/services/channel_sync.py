@@ -9,10 +9,10 @@ import logging
 
 import discord
 
-from app.config import get_settings
 from app.constants import EventType
 from app.services.activity_log import write_log
 from app.services.route_cache import refresh_route_cache
+from app.services.server_cache import refresh_server_pair
 from app.services.signalpeak_api import api_configured, get_json, post_json
 
 logger = logging.getLogger("signalpeak.channels")
@@ -68,12 +68,12 @@ def pair_channels(source: list[ChannelSlot], destination: list[ChannelSlot]) -> 
 async def sync_channels_if_empty(client: discord.Client) -> int:
     """Load both servers and insert one route per matching text channel. Skip when rows already exist."""
 
-    settings = get_settings()
-    source_id = settings.source_server_snowflake
-    destination_id = settings.destination_server_snowflake
-    if source_id is None or destination_id is None:
-        logger.error("Set SOURCE_SERVER_ID and DESTINATION_SERVER_ID before the first channel mapping.")
+    pair = await refresh_server_pair()
+    if pair is None:
+        logger.error("Source and destination server ids are not saved in signalpeak_discord_servers.")
         return 0
+    source_id = pair.source_server_id
+    destination_id = pair.destination_server_id
 
     if await _pairs_already_saved():
         return 0

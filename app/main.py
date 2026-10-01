@@ -13,6 +13,7 @@ from app.bot import bot
 from app.config import get_settings
 from app.services.replace_cache import refresh_replace_rules
 from app.services.route_cache import refresh_route_cache
+from app.services.server_cache import refresh_server_pair
 
 logger = logging.getLogger("signalpeak")
 
@@ -38,6 +39,7 @@ async def lifespan(app: FastAPI):
 
     await refresh_replace_rules()
     await refresh_route_cache()
+    await refresh_server_pair()
 
     bot_task: asyncio.Task | None = None
     token = settings.discord_bot_token.strip()
