@@ -9,6 +9,7 @@ from app.services.activity_log import write_log
 from app.services.bot_client import bot
 from app.services.channel_sync import sync_channels_if_empty
 from app.services.forwarder import handle_incoming_message
+from app.services.free_trial import enforce_join, handle_interaction, start_expiry_loop
 from app.services.members import process_pending_member_actions
 from app.services.route_cache import tracked_server_ids
 from app.services.routes import refresh_route_names
@@ -40,6 +41,7 @@ async def on_ready() -> None:
         logger.info("Processed %s pending member action(s)", processed)
     except Exception:
         logger.exception("Could not process pending member actions")
+    start_expiry_loop()
 
 
 @bot.event
@@ -58,6 +60,12 @@ async def on_member_join(member: discord.Member) -> None:
         str(member),
         f"{member} joined {member.guild.name}",
     )
+    await enforce_join(member)
+
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction) -> None:
+    await handle_interaction(interaction)
 
 
 @bot.event
