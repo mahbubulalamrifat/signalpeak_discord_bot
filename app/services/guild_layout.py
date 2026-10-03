@@ -5,12 +5,13 @@ import logging
 import discord
 from fastapi import HTTPException
 
+from app.config import get_settings
 from app.constants import EventType
 from app.services.activity_log import write_log
 from app.services.bot_client import bot
-from app.services.route_cache import all_routes
+from app.services.route_cache import all_routes, refresh_route_cache
 from app.services.server_cache import server_pair
-from app.services.signalpeak_api import patch_json
+from app.services.signalpeak_api import delete_json, patch_json
 
 logger = logging.getLogger("signalpeak.layout")
 
@@ -18,6 +19,44 @@ logger = logging.getLogger("signalpeak.layout")
 def require_connected_bot() -> None:
     if not bot.is_ready():
         raise HTTPException(status_code=503, detail="Bot is not connected")
+
+
+def member_only_overwrites(guild: discord.Guild) -> dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
+    """Deny @everyone. Allow the Member role (APPROVAL_ROLE_ID) and the bot."""
+
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+    }
+    role_id = get_settings().approval_role_snowflake
+    if role_id is not None:
+        role = guild.get_role(role_id)
+        if role is not None:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_message_history=True,
+                send_messages=True,
+                embed_links=True,
+                attach_files=True,
+                add_reactions=True,
+                use_application_commands=True,
+            )
+        else:
+            logger.warning("APPROVAL_ROLE_ID %s was not found in %s", role_id, guild.id)
+    else:
+        logger.warning("APPROVAL_ROLE_ID is empty, so new channels are hidden from everyone including Member.")
+
+    me = guild.me
+    if me is not None:
+        overwrites[me] = discord.PermissionOverwrite(
+            view_channel=True,
+            manage_channels=True,
+            manage_messages=True,
+            send_messages=True,
+            read_message_history=True,
+            embed_links=True,
+            attach_files=True,
+        )
+    return overwrites
 
 
 async def load_guild(server_id: int | None) -> discord.Guild:
@@ -44,6 +83,50 @@ def channel_payload(channel: discord.abc.GuildChannel) -> dict:
         "type": str(getattr(channel.type, "name", channel.type)),
         "category_id": None if category is None else str(category.id),
         "category_name": None if category is None else category.name,
+    }
+
+
+async def lock_all_member_only(guild: discord.Guild) -> dict:
+    """One-time: set every category and text channel so only the Member role can view."""
+
+    role_id = get_settings().approval_role_snowflake
+    if role_id is None:
+        raise HTTPException(status_code=400, detail="Set APPROVAL_ROLE_ID in the bot .env first")
+    if guild.get_role(role_id) is None:
+        raise HTTPException(status_code=400, detail=f"Member role {role_id} was not found in this server")
+
+    overwrites = member_only_overwrites(guild)
+    channels = await guild.fetch_channels()
+    updated_categories = 0
+    updated_channels = 0
+    failed: list[dict] = []
+
+    for channel in channels:
+        if not isinstance(channel, (discord.CategoryChannel, discord.TextChannel)):
+            continue
+        try:
+            await channel.edit(overwrites=overwrites, reason="Lock existing channels for Member role only")
+        except discord.Forbidden:
+            failed.append({"id": str(channel.id), "name": channel.name, "error": "forbidden"})
+            continue
+        except discord.HTTPException as exc:
+            failed.append({"id": str(channel.id), "name": channel.name, "error": str(exc)})
+            continue
+        if isinstance(channel, discord.CategoryChannel):
+            updated_categories += 1
+        else:
+            updated_channels += 1
+
+    await _log_layout(
+        guild,
+        EventType.PERMISSIONS_LOCKED,
+        f"Locked {updated_categories} categories and {updated_channels} channels for Member only",
+    )
+    return {
+        "updated_categories": updated_categories,
+        "updated_channels": updated_channels,
+        "failed": failed,
+        "member_role_id": str(role_id),
     }
 
 
@@ -79,7 +162,10 @@ async def create_category(guild: discord.Guild, name: str, position: int | None)
     cleaned = name.strip()
     if not cleaned:
         raise HTTPException(status_code=400, detail="Name cannot be blank")
-    kwargs: dict = {"reason": "Created from SignalPeak"}
+    kwargs: dict = {
+        "reason": "Created from SignalPeak",
+        "overwrites": member_only_overwrites(guild),
+    }
     if position is not None:
         kwargs["position"] = position
     try:
@@ -114,7 +200,11 @@ async def create_text_channel(guild: discord.Guild, name: str, category_id: int,
     cleaned = name.strip()
     if not cleaned:
         raise HTTPException(status_code=400, detail="Name cannot be blank")
-    kwargs: dict = {"category": category, "reason": "Created from SignalPeak"}
+    kwargs: dict = {
+        "category": category,
+        "reason": "Created from SignalPeak",
+        "overwrites": member_only_overwrites(guild),
+    }
     if position is not None:
         kwargs["position"] = position
     try:
@@ -171,6 +261,59 @@ async def move_channel(guild: discord.Guild, channel_id: int, category_id: int |
     place = category.name if category is not None else "no category"
     await _log_layout(guild, EventType.CHANNEL_MOVED, f"Moved #{channel.name} to {place}", channel_id=channel.id, channel_name=channel.name)
     return channel
+
+
+async def delete_text_channel(guild: discord.Guild, channel_id: int) -> dict:
+    channel = await _text_channel(guild, channel_id)
+    payload = channel_payload(channel)
+    try:
+        await channel.delete(reason="Deleted from SignalPeak")
+    except discord.Forbidden as exc:
+        raise HTTPException(status_code=403, detail="Bot cannot delete that channel") from exc
+    except discord.HTTPException as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await _forget_destination_channel(channel_id)
+    await refresh_route_cache()
+    await _log_layout(
+        guild,
+        EventType.CHANNEL_DELETED,
+        f"Deleted #{payload['name']}",
+        channel_id=channel_id,
+        channel_name=payload["name"],
+    )
+    return {"deleted": True, **payload}
+
+
+async def delete_category(guild: discord.Guild, category_id: int) -> dict:
+    category = await _category(guild, category_id)
+    name = category.name
+    channels = [channel for channel in category.channels if isinstance(channel, discord.TextChannel)]
+    deleted_channels: list[dict] = []
+    for channel in channels:
+        deleted_channels.append(await delete_text_channel(guild, channel.id))
+    try:
+        await category.delete(reason="Deleted from SignalPeak")
+    except discord.Forbidden as exc:
+        raise HTTPException(status_code=403, detail="Bot cannot delete that category") from exc
+    except discord.HTTPException as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await _log_layout(
+        guild,
+        EventType.CATEGORY_DELETED,
+        f"Deleted category {name}",
+        category_id=category_id,
+        category_name=name,
+    )
+    return {"deleted": True, "id": str(category_id), "name": name, "channels": deleted_channels}
+
+
+async def _forget_destination_channel(channel_id: int) -> None:
+    for route in await all_routes():
+        if route.destination_channel_id == channel_id or route.source_channel_id == channel_id:
+            try:
+                await delete_json(f"/discord/routes/{route.id}")
+            except Exception:
+                logger.exception("Could not remove route %s after channel delete", route.id)
 
 
 async def order_channels(guild: discord.Guild, items: list[dict]) -> None:

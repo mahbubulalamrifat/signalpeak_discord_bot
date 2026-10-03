@@ -4,7 +4,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.deps import require_admin
-from app.services.guild_layout import channel_payload, create_text_channel, load_guild, move_channel, rename_channel
+from app.services.guild_layout import (
+    channel_payload,
+    create_text_channel,
+    delete_text_channel,
+    load_guild,
+    move_channel,
+    rename_channel,
+)
 
 router = APIRouter(prefix="/channels", tags=["discord-channels"], dependencies=[Depends(require_admin)])
 
@@ -29,6 +36,11 @@ class ChannelMove(BaseModel):
     position: int | None = Field(default=None, ge=0)
 
 
+class ChannelDelete(BaseModel):
+    channel_id: str
+    server_id: str | None = None
+
+
 @router.post("", status_code=201)
 async def store(body: ChannelCreate) -> dict:
     guild = await load_guild(_optional_id(body.server_id))
@@ -49,6 +61,12 @@ async def move(body: ChannelMove) -> dict:
     category_id = None if body.category_id is None or body.category_id.strip() == "" else _required_id(body.category_id, "category_id")
     channel = await move_channel(guild, _required_id(body.channel_id, "channel_id"), category_id, body.position)
     return channel_payload(channel)
+
+
+@router.post("/delete")
+async def destroy(body: ChannelDelete) -> dict:
+    guild = await load_guild(_optional_id(body.server_id))
+    return await delete_text_channel(guild, _required_id(body.channel_id, "channel_id"))
 
 
 def _optional_id(value: str | None) -> int | None:
