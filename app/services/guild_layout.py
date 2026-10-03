@@ -22,10 +22,18 @@ def require_connected_bot() -> None:
 
 
 def member_only_overwrites(guild: discord.Guild) -> dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
-    """Deny @everyone. Allow the Member role (APPROVAL_ROLE_ID) and the bot."""
+    """Everyone can see category/channel names. Only Member can read and send messages."""
 
     overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            read_message_history=False,
+            send_messages=False,
+            add_reactions=False,
+            attach_files=False,
+            embed_links=False,
+            use_application_commands=False,
+        ),
     }
     role_id = get_settings().approval_role_snowflake
     if role_id is not None:
@@ -43,7 +51,7 @@ def member_only_overwrites(guild: discord.Guild) -> dict[discord.abc.Snowflake, 
         else:
             logger.warning("APPROVAL_ROLE_ID %s was not found in %s", role_id, guild.id)
     else:
-        logger.warning("APPROVAL_ROLE_ID is empty, so new channels are hidden from everyone including Member.")
+        logger.warning("APPROVAL_ROLE_ID is empty, so only channel names are visible; nobody can read messages.")
 
     me = guild.me
     if me is not None:
@@ -105,7 +113,10 @@ async def lock_all_member_only(guild: discord.Guild) -> dict:
         if not isinstance(channel, (discord.CategoryChannel, discord.TextChannel)):
             continue
         try:
-            await channel.edit(overwrites=overwrites, reason="Lock existing channels for Member role only")
+            await channel.edit(
+                overwrites=overwrites,
+                reason="Everyone can see names; only Member can read messages",
+            )
         except discord.Forbidden:
             failed.append({"id": str(channel.id), "name": channel.name, "error": "forbidden"})
             continue
