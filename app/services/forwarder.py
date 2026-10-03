@@ -149,15 +149,19 @@ async def _forward_one(message: discord.Message, route: CachedRoute) -> None:
             await post_json(
                 "/discord/message-links",
                 {
-                    "source_message_id": message.id,
-                    "source_channel_id": message.channel.id,
-                    "destination_message_id": sent[0].id,
-                    "destination_channel_id": route.destination_channel_id,
-                    "destination_server_id": route.destination_server_id,
+                    "source_message_id": str(message.id),
+                    "source_channel_id": str(message.channel.id),
+                    "destination_message_id": str(sent[0].id),
+                    "destination_channel_id": str(route.destination_channel_id),
+                    "destination_server_id": str(route.destination_server_id),
                 },
             )
         except Exception:
-            pass
+            logger.exception(
+                "Could not save message link for source %s -> destination %s",
+                message.id,
+                sent[0].id,
+            )
     try:
         await patch_json(
             f"/discord/routes/{route.id}/last-message",
@@ -309,27 +313,85 @@ def _copy_embeds(message: discord.Message, channel_map: dict[int, int]) -> list[
     return copies
 
 
-async def _destination_reply(message: discord.Message, route: CachedRoute, channel_map: dict[int, int]) -> discord.MessageReference | None:
+async def _destination_reply(
+    message: discord.Message,
+    route: CachedRoute,
+    channel_map: dict[int, int],
+) -> discord.MessageReference | None:
+    """Map a source reply onto the matching destination message. Never reuse the source reference."""
+
     reference = message.reference
     if reference is None or reference.message_id is None:
         return None
-    destination_channel_id = channel_map.get(int(reference.channel_id)) if reference.channel_id else None
-    query = f"/discord/message-links?source_message_id={int(reference.message_id)}&destination_server_id={route.destination_server_id}"
-    if destination_channel_id is not None:
-        query += f"&destination_channel_id={destination_channel_id}"
-    try:
-        payload = await get_json(query)
-    except Exception:
+    # Discord forward snapshots are not normal replies.
+    ref_type = getattr(reference, "type", None)
+    if ref_type is not None and int(getattr(ref_type, "value", ref_type)) != 0:
         return None
-    link = payload.get("link")
-    if not link:
-        return None
-    return discord.MessageReference(
-        message_id=int(link["destination_message_id"]),
-        channel_id=int(link["destination_channel_id"]),
-        guild_id=int(route.destination_server_id),
-        fail_if_not_exists=False,
+
+    source_message_id = int(reference.message_id)
+    source_channel_id = int(reference.channel_id) if reference.channel_id else None
+    link = await _lookup_message_link(
+        source_message_id,
+        route.destination_server_id,
+        channel_map.get(source_channel_id) if source_channel_id is not None else None,
     )
+    if link is None:
+        return None
+
+    destination_message_id = int(link["destination_message_id"])
+    destination_channel_id = int(link["destination_channel_id"])
+    if destination_message_id == source_message_id or (
+        source_channel_id is not None and destination_channel_id == source_channel_id
+    ):
+        logger.error(
+            "Refusing source-looking message link for reply %s (channel %s)",
+            source_message_id,
+            source_channel_id,
+        )
+        return None
+
+    try:
+        dest_channel = await _destination_channel(destination_channel_id)
+        dest_message = await dest_channel.fetch_message(destination_message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException, RuntimeError):
+        logger.warning(
+            "Destination reply target %s/%s missing for source reply %s",
+            destination_channel_id,
+            destination_message_id,
+            source_message_id,
+        )
+        return None
+
+    return dest_message.to_reference(fail_if_not_exists=False)
+
+
+async def _lookup_message_link(
+    source_message_id: int,
+    destination_server_id: int,
+    destination_channel_id: int | None,
+) -> dict | None:
+    queries = [
+        f"/discord/message-links?source_message_id={source_message_id}&destination_server_id={destination_server_id}",
+    ]
+    if destination_channel_id is not None:
+        queries.insert(
+            0,
+            (
+                f"/discord/message-links?source_message_id={source_message_id}"
+                f"&destination_server_id={destination_server_id}"
+                f"&destination_channel_id={destination_channel_id}"
+            ),
+        )
+    for query in queries:
+        try:
+            payload = await get_json(query)
+        except Exception:
+            logger.exception("Message-link lookup failed for source %s", source_message_id)
+            continue
+        link = payload.get("link")
+        if link:
+            return link
+    return None
 
 
 def _route_fields(route: CachedRoute) -> dict:
