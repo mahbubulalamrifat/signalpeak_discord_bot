@@ -13,23 +13,34 @@ logger = logging.getLogger("signalpeak.routes")
 
 
 async def refresh_route_names(bot: discord.Client) -> int:
-    """Update stored server and channel names from Discord for the ids already cached."""
+    """Update stored server and channel names from Discord only when they changed."""
 
     updated = 0
+    patched = 0
     snapshot_cache: dict[int, tuple[str | None, dict[int, tuple[str, int | None, str | None]]]] = {}
     for route in await all_routes():
         changes: dict[str, str | int | None] = {}
-        pairs = (
-            ("source", route.source_server_id, route.source_channel_id, route.source_server_name, route.source_channel_name),
+        sides = (
+            (
+                "source",
+                route.source_server_id,
+                route.source_channel_id,
+                route.source_server_name,
+                route.source_channel_name,
+                route.source_category_id,
+                route.source_category_name,
+            ),
             (
                 "destination",
                 route.destination_server_id,
                 route.destination_channel_id,
                 route.destination_server_name,
                 route.destination_channel_name,
+                route.destination_category_id,
+                route.destination_category_name,
             ),
         )
-        for side, server_id, channel_id, server_name_now, channel_name_now in pairs:
+        for side, server_id, channel_id, server_name_now, channel_name_now, category_id_now, category_name_now in sides:
             server_name, channels = await _guild_snapshot(bot, int(server_id), snapshot_cache)
             if server_name and server_name_now != server_name:
                 changes[f"{side}_server_name"] = server_name[:255]
@@ -40,21 +51,26 @@ async def refresh_route_names(bot: discord.Client) -> int:
             if info is None:
                 continue
             channel_name, category_id, category_name = info
+            category_name = _clip_name(category_name)
             if channel_name and channel_name_now != channel_name:
                 changes[f"{side}_channel_name"] = channel_name[:255]
                 updated += 1
-            changes[f"{side}_category_id"] = category_id
-            changes[f"{side}_category_name"] = _clip_name(category_name)
-            updated += 1
+            if category_id_now != category_id:
+                changes[f"{side}_category_id"] = category_id
+                updated += 1
+            if (category_name_now or None) != (category_name or None):
+                changes[f"{side}_category_name"] = category_name
+                updated += 1
         if changes:
             await patch_json(f"/discord/routes/{route.id}", changes)
-    if updated:
+            patched += 1
+    if patched:
         await write_log(
             event_type=EventType.NAMES_REFRESHED,
             detail=f"Updated {updated} server or channel name field(s) from Discord",
-            extra={"fields": updated},
+            extra={"fields": updated, "routes": patched},
         )
-    await refresh_route_cache()
+        await refresh_route_cache()
     return updated
 
 

@@ -29,8 +29,7 @@ async def refresh_server_pair() -> ServerPair | None:
         payload = await get_json("/discord/servers")
     except Exception:
         logger.exception("Could not load source and destination server ids from the API.")
-        _pair = None
-        return None
+        return _pair
     source_id = _snowflake(payload.get("source_server_id"))
     destination_id = _snowflake(payload.get("destination_server_id"))
     if source_id is None or destination_id is None:

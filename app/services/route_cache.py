@@ -14,10 +14,14 @@ class CachedRoute:
     id: int
     source_server_id: int
     source_server_name: str
+    source_category_id: int | None
+    source_category_name: str | None
     source_channel_id: int
     source_channel_name: str
     destination_server_id: int
     destination_server_name: str
+    destination_category_id: int | None
+    destination_category_name: str | None
     destination_channel_id: int
     destination_channel_name: str
 
@@ -60,7 +64,13 @@ async def get_channel_map(destination_server_id: int) -> dict[int, int]:
 async def refresh_route_cache() -> _RouteCache:
     global _cache
     async with _lock:
-        loaded = await _load()
+        try:
+            loaded = await _load()
+        except Exception:
+            logger.exception("Could not refresh channel pairs from the API.")
+            if _cache is not None:
+                return _cache
+            return _RouteCache()
         _cache = loaded
         return loaded
 
@@ -70,6 +80,12 @@ async def _load() -> _RouteCache:
         logger.error("SIGNALPEAK_API_URL is empty, so channel pairs were not loaded.")
         return _RouteCache()
     return await _load_from_api()
+
+
+def _optional_snowflake(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
 
 
 async def _load_from_api() -> _RouteCache:
@@ -83,10 +99,14 @@ async def _load_from_api() -> _RouteCache:
             id=int(item["id"]),
             source_server_id=int(item["source_server_id"]),
             source_server_name=item["source_server_name"],
+            source_category_id=_optional_snowflake(item.get("source_category_id")),
+            source_category_name=item.get("source_category_name"),
             source_channel_id=int(item["source_channel_id"]),
             source_channel_name=item["source_channel_name"],
             destination_server_id=int(item["destination_server_id"]),
             destination_server_name=item["destination_server_name"],
+            destination_category_id=_optional_snowflake(item.get("destination_category_id")),
+            destination_category_name=item.get("destination_category_name"),
             destination_channel_id=int(item["destination_channel_id"]),
             destination_channel_name=item["destination_channel_name"],
         )
