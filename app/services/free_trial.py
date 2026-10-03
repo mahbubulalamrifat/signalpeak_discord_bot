@@ -4,6 +4,7 @@ import logging
 
 import discord
 
+from app.config import get_settings
 from app.services.server_cache import server_pair
 from app.services.signalpeak_api import get_json, post_json
 
@@ -12,7 +13,6 @@ logger = logging.getLogger("signalpeak.free_trial")
 FREE_TRIAL = "join_plan:free_trial"
 MONTHLY = "join_plan:monthly"
 LIFETIME = "join_plan:lifetime"
-EMAIL_MODAL = "join_plan:free_trial_email"
 
 
 async def enforce_join(member: discord.Member) -> None:
@@ -34,6 +34,7 @@ async def enforce_join(member: discord.Member) -> None:
         await _remove(member.guild, member.id, "Free trial already used")
         return
     if reason == "free_trial_active":
+        await _grant_member_role(member)
         return
 
     await _offer_plans(member)
@@ -42,13 +43,10 @@ async def enforce_join(member: discord.Member) -> None:
 async def handle_interaction(interaction: discord.Interaction) -> None:
     custom_id = (interaction.data or {}).get("custom_id")
     if custom_id == FREE_TRIAL:
-        await interaction.response.send_modal(_email_modal())
+        await _start_trial(interaction)
         return
     if custom_id in {MONTHLY, LIFETIME}:
         await interaction.response.send_message("This option is not open yet.", ephemeral=True)
-        return
-    if custom_id == EMAIL_MODAL:
-        await _start_trial(interaction)
 
 
 async def _offer_plans(member: discord.Member) -> None:
@@ -62,17 +60,7 @@ async def _offer_plans(member: discord.Member) -> None:
         logger.info("Could not send join options to %s", member.id)
 
 
-def _email_modal() -> discord.ui.Modal:
-    modal = discord.ui.Modal(title="Free trial", custom_id=EMAIL_MODAL)
-    modal.add_item(discord.ui.TextInput(label="Email", custom_id="email", required=True, max_length=255))
-    return modal
-
-
 async def _start_trial(interaction: discord.Interaction) -> None:
-    email = _modal_value(interaction, "email")
-    if not email or "@" not in email:
-        await interaction.response.send_message("Enter a valid email to start the free trial.", ephemeral=True)
-        return
     pair = server_pair()
     destination_id = pair.destination_server_id if pair else None
     if destination_id is None:
@@ -86,21 +74,40 @@ async def _start_trial(interaction: discord.Interaction) -> None:
                 "discord_user_id": user.id,
                 "server_id": destination_id,
                 "username": str(user),
-                "email": email,
             },
         )
     except Exception:
         await interaction.response.send_message("This Discord account cannot start another free trial.", ephemeral=True)
         return
+
     await interaction.response.send_message("Your free trial has started. It lasts 1 day.", ephemeral=True)
 
+    if isinstance(user, discord.Member):
+        await _grant_member_role(user)
+        return
+    guild = interaction.guild
+    if guild is None and pair is not None:
+        guild = interaction.client.get_guild(pair.destination_server_id)
+    if guild is None:
+        return
+    try:
+        member = guild.get_member(user.id) or await guild.fetch_member(user.id)
+        await _grant_member_role(member)
+    except (discord.NotFound, discord.Forbidden):
+        return
 
-def _modal_value(interaction: discord.Interaction, custom_id: str) -> str:
-    for row in (interaction.data or {}).get("components", []):
-        for component in row.get("components", []):
-            if component.get("custom_id") == custom_id:
-                return str(component.get("value", "")).strip()
-    return ""
+
+async def _grant_member_role(member: discord.Member) -> None:
+    role_id = get_settings().approval_role_snowflake
+    if role_id is None:
+        return
+    role = member.guild.get_role(role_id)
+    if role is None or role in member.roles:
+        return
+    try:
+        await member.add_roles(role, reason="Free trial started")
+    except discord.Forbidden:
+        logger.warning("Bot cannot assign Member role %s in %s", role_id, member.guild.id)
 
 
 async def _remove(guild: discord.Guild, user_id: int, reason: str) -> None:
