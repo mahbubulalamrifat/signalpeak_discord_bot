@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     signalpeak_api_url: str = ""
     signalpeak_api_token: str = ""
+    image_process_url: str = "http://172.28.0.1:7777/process"
 
     @property
     def approval_role_snowflake(self) -> int | None:

@@ -1,6 +1,10 @@
 """Forward a source-channel message to each destination stored in signalpeak_discord."""
 
 import logging
+import mimetypes
+import os
+from pathlib import Path
+import tempfile
 
 import discord
 
@@ -8,6 +12,7 @@ from app.config import get_settings
 from app.constants import EventType
 from app.services.activity_log import write_log
 from app.services.bot_client import bot
+from app.services.image_process import manipulate_image
 from app.services.replacements import apply_replacements, rewrite_channel_mentions
 from app.services.replace_cache import get_replace_rules
 from app.services.route_cache import CachedRoute, get_channel_map, get_routes_for_source, tracked_server_ids
@@ -144,6 +149,18 @@ async def _forward_one(message: discord.Message, route: CachedRoute) -> None:
     channel = await _destination_channel(route.destination_channel_id)
     reply_to = await _destination_reply(message, route, channel_map)
     sent, attachment_errors = await _deliver(channel, cleaned_parts, list(message.attachments), embeds, reply_to)
+    if not sent:
+        await write_log(
+            event_type=EventType.MESSAGE_SKIPPED,
+            level="warning",
+            detail="Image processing failed, so the image was not forwarded",
+            actor_id=message.author.id,
+            actor_name=str(message.author),
+            message_id=message.id,
+            extra={"attachment_errors": attachment_errors},
+            **_route_fields(route),
+        )
+        return
     if sent:
         try:
             await post_json(
@@ -235,21 +252,34 @@ async def _deliver(
             sent.append(message)
 
     batches = [attachments[index : index + _FILES_PER_MESSAGE] for index in range(0, len(attachments), _FILES_PER_MESSAGE)]
-    for index, batch in enumerate(batches):
-        embed_payload = embeds if not parts and index == 0 else []
-        try:
-            message = await _send(channel, None, batch, embed_payload, reply)
-            reply = None
-        except Exception as exc:
-            if not sent:
-                raise
-            errors.append(str(exc))
-            logger.exception("Attachment batch failed after text was already forwarded")
-            break
-        if message is not None:
-            sent.append(message)
+    cleanup_paths: list[str] = []
+    try:
+        for index, batch in enumerate(batches):
+            embed_payload = embeds if not parts and index == 0 else []
+            try:
+                files, paths = await _files(batch)
+                cleanup_paths.extend(paths)
+                if not files and not embed_payload:
+                    errors.append("Image was not forwarded because processing failed")
+                    continue
+                message = await _send(channel, None, files, embed_payload, reply)
+                reply = None
+            except Exception as exc:
+                if not sent:
+                    raise
+                errors.append(str(exc))
+                logger.exception("Attachment batch failed after text was already forwarded")
+                break
+            if message is not None:
+                sent.append(message)
+    finally:
+        for path in cleanup_paths:
+            if os.path.exists(path):
+                os.remove(path)
 
     if not sent:
+        if errors and not parts and not embeds:
+            return [], errors
         raise RuntimeError("Discord did not accept the forwarded message")
     return sent, errors
 
@@ -257,19 +287,19 @@ async def _deliver(
 async def _send(
     channel,
     content: str | None,
-    attachments: list[discord.Attachment],
+    files: list[discord.File],
     embeds: list[discord.Embed],
     reference: discord.MessageReference | None = None,
 ) -> discord.Message | None:
-    if not content and not attachments and not embeds and reference is None:
+    if not content and not files and not embeds and reference is None:
         return None
     try:
-        return await channel.send(**_payload(content, await _files(attachments), embeds, reference))
+        return await channel.send(**_payload(content, files, embeds, reference))
     except discord.HTTPException:
         if not embeds:
             raise
         logger.warning("Discord rejected the message with embeds; retrying without embeds")
-        return await channel.send(**_payload(content, await _files(attachments), [], reference))
+        return await channel.send(**_payload(content, files, [], reference))
 
 
 def _payload(
@@ -290,8 +320,54 @@ def _payload(
     return payload
 
 
-async def _files(attachments: list[discord.Attachment]) -> list[discord.File]:
-    return [await attachment.to_file() for attachment in attachments]
+async def _files(attachments: list[discord.Attachment]) -> tuple[list[discord.File], list[str]]:
+    files: list[discord.File] = []
+    cleanup: list[str] = []
+    for attachment in attachments:
+        if not _is_image(attachment):
+            files.append(await attachment.to_file())
+            continue
+        downloaded = await _download_attachment(attachment)
+        if downloaded is None:
+            logger.warning("Could not download image %s; it will not be forwarded", attachment.filename)
+            continue
+        cleanup.append(downloaded)
+        processed = await manipulate_image(downloaded)
+        if processed is None:
+            logger.warning("Image processing failed for %s; original image will not be sent", attachment.filename)
+            continue
+        if os.path.abspath(processed) != os.path.abspath(downloaded):
+            cleanup.append(processed)
+            filename = f"{Path(attachment.filename).stem}.png"
+        else:
+            filename = attachment.filename or "image"
+        files.append(discord.File(processed, filename=filename))
+    return files, cleanup
+
+
+async def _download_attachment(attachment: discord.Attachment) -> str | None:
+    suffix = Path(attachment.filename or "").suffix
+    if not suffix:
+        content_type = (attachment.content_type or "").split(";", 1)[0].strip()
+        suffix = mimetypes.guess_extension(content_type) or ".img"
+    handle, path = tempfile.mkstemp(suffix=suffix)
+    os.close(handle)
+    try:
+        await attachment.save(path)
+    except Exception:
+        logger.exception("Could not save attachment %s", attachment.filename)
+        if os.path.exists(path):
+            os.remove(path)
+        return None
+    return path
+
+
+def _is_image(attachment: discord.Attachment) -> bool:
+    content_type = (attachment.content_type or "").lower()
+    if content_type.startswith("image/"):
+        return True
+    guessed = mimetypes.guess_type(attachment.filename or "")[0] or ""
+    return guessed.startswith("image/")
 
 
 def _copy_embeds(message: discord.Message, channel_map: dict[int, int]) -> list[discord.Embed]:
