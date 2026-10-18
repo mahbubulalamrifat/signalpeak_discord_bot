@@ -32,7 +32,7 @@ async def manipulate_image(image_path: str) -> str | None:
             raise ValueError(f"Could not determine a supported image MIME type for {image_path!r}")
 
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=180.0, write=120.0, pool=10.0),
+            timeout=httpx.Timeout(connect=10.0, read=600.0, write=120.0, pool=10.0),
             trust_env=False,
         ) as client:
             with open(image_path, "rb") as image_file:
