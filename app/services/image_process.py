@@ -1,12 +1,11 @@
 """Send images to the processor before they are forwarded."""
 
-import json
 import logging
 import mimetypes
 import os
 import tempfile
 
-import aiohttp
+import httpx
 
 from app.config import get_settings
 
@@ -32,46 +31,45 @@ async def manipulate_image(image_path: str) -> str | None:
         if not image_mime_type or not image_mime_type.startswith("image/"):
             raise ValueError(f"Could not determine a supported image MIME type for {image_path!r}")
 
-        timeout = aiohttp.ClientTimeout(total=180, connect=10, sock_read=180)
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=180.0, write=120.0, pool=10.0),
+            trust_env=False,
+        ) as client:
             with open(image_path, "rb") as image_file:
-                form = aiohttp.FormData()
-                form.add_field(
-                    "image",
-                    image_file,
-                    filename=os.path.basename(image_path),
-                    content_type=image_mime_type,
-                )
-                async with client.post(url, data=form) as response:
-                    body = await response.read()
-                    if response.status >= 400:
-                        text = body.decode("utf-8", errors="replace")
-                        try:
-                            data = json.loads(text) if text else {}
-                        except json.JSONDecodeError:
-                            data = {}
-                        if not isinstance(data, dict):
-                            data = {}
-                        if data.get("reason") == _NO_PROVIDER:
-                            logger.info(
-                                "Image manipulation skipped: no approved provider name detected; original image will be forwarded"
-                            )
-                            _remove(output_path)
-                            return image_path
-                        logger.error(
-                            "Image manipulation failed: HTTP %s from %s; response=%r",
-                            response.status,
-                            url,
-                            text[:500],
+                response = await client.post(
+                    url,
+                    files={
+                        "image": (
+                            os.path.basename(image_path),
+                            image_file,
+                            image_mime_type,
                         )
-                        _remove(output_path)
-                        return None
+                    },
+                )
 
-        if not body:
+        if response.status_code >= 400:
+            text = response.text[:500]
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            if data.get("reason") == _NO_PROVIDER:
+                logger.info(
+                    "Image manipulation skipped: no approved provider name detected; original image will be forwarded"
+                )
+                _remove(output_path)
+                return image_path
+            logger.error("Image manipulation failed: HTTP %s from %s; response=%r", response.status_code, url, text)
+            _remove(output_path)
+            return None
+
+        if not response.content:
             raise ValueError("Image processing service returned an empty response")
 
         with open(output_path, "wb") as processed_image:
-            processed_image.write(body)
+            processed_image.write(response.content)
         return output_path
     except Exception:
         logger.exception("Image manipulation failed for %r using %s", image_path, url or "unset")
