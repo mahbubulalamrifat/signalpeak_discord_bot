@@ -398,7 +398,7 @@ async def copy_existing_forum_posts() -> dict:
             logger.exception("Could not list posts in forum %s", source.id)
             failed_threads += 1
             continue
-        logger.info("Copying %s existing post(s) from #%s", len(threads), source.name)
+        logger.info("Creating %s post(s) in #%s without old messages", len(threads), source.name)
         for thread in threads:
             try:
                 created, messages = await _copy_forum_thread(thread, destination, route)
@@ -417,7 +417,7 @@ async def copy_existing_forum_posts() -> dict:
         "skipped_threads": skipped_threads,
         "failed_threads": failed_threads,
     }
-    logger.info("Forum history copy finished: %s", summary)
+    logger.info("Forum post copy finished: %s", summary)
     return summary
 
 
@@ -443,83 +443,26 @@ async def _copy_forum_thread(
     forum: discord.ForumChannel,
     route: CachedRoute,
 ) -> tuple[bool, int]:
-    """Copy one source post. Returns whether this call created it, and how many messages were sent."""
+    """Create the destination post only. Older messages inside the source post are not copied."""
 
-    messages = [
-        message
-        async for message in source_thread.history(limit=None, oldest_first=True)
-        if bot.user is None or message.author.id != bot.user.id
-    ]
-    messages = [message for message in messages if message.content or message.attachments or message.embeds]
-    if not messages:
-        return False, 0
-
-    created = False
-    sent_count = 0
     async with _lock_for(source_thread.id):
-        destination_thread = await _linked_thread(source_thread.id, route.destination_server_id)
-        pending = []
-        for message in messages:
-            if await _lookup_message_link(message.id, route.destination_server_id, None):
-                continue
-            pending.append(message)
-        if destination_thread is None:
-            if not pending:
-                return False, 0
-            first = pending.pop(0)
-            parts, embeds = await _prepared_message(first, route)
-            if not parts and not first.attachments and not embeds:
-                parts = [source_thread.name[:2000]]
-            destination_thread, sent, _errors = await _open_forum_post(
-                forum,
-                source_thread.name,
-                parts,
-                list(first.attachments),
-                embeds,
-            )
-            await _save_message_link(
-                source_thread.id,
-                source_thread.id,
-                destination_thread.id,
-                destination_thread.id,
-                route.destination_server_id,
-            )
-            if first.id != source_thread.id and sent:
-                await _save_message_link(
-                    first.id,
-                    source_thread.id,
-                    sent[0].id,
-                    destination_thread.id,
-                    route.destination_server_id,
-                )
-            created = True
-            sent_count += len(sent)
-        elif not pending:
+        if await _linked_thread(source_thread.id, route.destination_server_id):
             return False, 0
-
-        for message in pending:
-            parts, embeds = await _prepared_message(message, route)
-            if not parts and not message.attachments and not embeds:
-                continue
-            sent, _errors = await _deliver(destination_thread, parts, list(message.attachments), embeds, None)
-            if not sent:
-                continue
-            await _save_message_link(
-                message.id,
-                source_thread.id,
-                sent[0].id,
-                destination_thread.id,
-                route.destination_server_id,
-            )
-            sent_count += len(sent)
-    return created, sent_count
-
-
-async def _prepared_message(message: discord.Message, route: CachedRoute) -> tuple[list[str], list[discord.Embed]]:
-    rules = list(await get_replace_rules())
-    channel_map = await get_channel_map(route.destination_server_id)
-    replaced = apply_replacements(rewrite_channel_mentions(message.content or "", channel_map), rules)
-    return split_discord_content(replaced.text), _copy_embeds(message, channel_map)
+        destination_thread, _sent, _errors = await _open_forum_post(
+            forum,
+            source_thread.name,
+            [source_thread.name[:2000]],
+            [],
+            [],
+        )
+        await _save_message_link(
+            source_thread.id,
+            source_thread.id,
+            destination_thread.id,
+            destination_thread.id,
+            route.destination_server_id,
+        )
+    return True, 0
 
 
 async def _save_message_link(
