@@ -261,7 +261,7 @@ async def _deliver_forum_message(
     async with _lock_for(source_thread.id):
         destination_thread = await _linked_thread(source_thread.id, route.destination_server_id)
         if destination_thread is None:
-            forum = await _destination_channel(route.destination_channel_id)
+            forum = await _fetch_channel(route.destination_channel_id)
             if not isinstance(forum, discord.ForumChannel):
                 raise RuntimeError(f"Destination channel {route.destination_channel_id} is not a forum")
             await _ensure_bot_can_post(forum)
@@ -384,8 +384,8 @@ async def copy_existing_forum_posts() -> dict:
     failed_threads = 0
     for route in await all_routes():
         try:
-            source = await _destination_channel(route.source_channel_id)
-            destination = await _destination_channel(route.destination_channel_id)
+            source = await _fetch_channel(route.source_channel_id)
+            destination = await _fetch_channel(route.destination_channel_id)
         except (RuntimeError, discord.HTTPException):
             logger.exception("Could not open forum pair %s", route.id)
             continue
@@ -546,6 +546,13 @@ async def _save_message_link(
             source_message_id,
             destination_message_id,
         )
+
+
+async def _fetch_channel(channel_id: int):
+    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    if channel is None:
+        raise RuntimeError(f"Channel {channel_id} was not found")
+    return channel
 
 
 async def _destination_channel(channel_id: int) -> discord.abc.Messageable:
