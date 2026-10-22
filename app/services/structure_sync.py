@@ -125,10 +125,8 @@ async def sync_destination_with_source() -> dict:
     # Rebuild after Discord mutations settle.
     source_channels = await source.fetch_channels()
     destination_channels = await destination.fetch_channels()
-    source_slots = [_slot(channel) for channel in source_channels if isinstance(channel, discord.TextChannel)]
-    destination_slots = [
-        _slot(channel) for channel in destination_channels if isinstance(channel, discord.TextChannel)
-    ]
+    source_slots = [_slot(channel) for channel in source_channels if _is_routed_channel(channel)]
+    destination_slots = [_slot(channel) for channel in destination_channels if _is_routed_channel(channel)]
     pairs, missing_destination, missing_source = pair_channels(source_slots, destination_slots)
 
     routes_payload = {
@@ -222,11 +220,15 @@ def _key(name: str) -> str:
     return name.strip().casefold()
 
 
-def _category_name(channel: discord.TextChannel) -> str | None:
+def _is_routed_channel(channel) -> bool:
+    return isinstance(channel, (discord.TextChannel, discord.ForumChannel))
+
+
+def _category_name(channel: discord.TextChannel | discord.ForumChannel) -> str | None:
     return channel.category.name if channel.category is not None else None
 
 
-def _slot(channel: discord.TextChannel) -> ChannelSlot:
+def _slot(channel: discord.TextChannel | discord.ForumChannel) -> ChannelSlot:
     category = channel.category
     return ChannelSlot(
         channel_id=channel.id,

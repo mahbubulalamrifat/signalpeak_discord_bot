@@ -175,7 +175,7 @@ async def _text_channels(client: discord.Client, server_id: int) -> tuple[discor
 
 
 def _slot(channel: discord.abc.GuildChannel) -> ChannelSlot | None:
-    if not isinstance(channel, discord.TextChannel):
+    if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
         return None
     category = channel.category
     return ChannelSlot(

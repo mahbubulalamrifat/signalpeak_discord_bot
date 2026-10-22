@@ -1,5 +1,6 @@
 """Forward a source-channel message to each destination stored in signalpeak_discord."""
 
+import asyncio
 import logging
 import mimetypes
 import os
@@ -24,6 +25,7 @@ settings = get_settings()
 
 _MENTIONS = discord.AllowedMentions.none()
 _FILES_PER_MESSAGE = 10
+_thread_locks: dict[int, asyncio.Lock] = {}
 
 
 async def handle_incoming_message(message: discord.Message) -> None:
@@ -34,7 +36,19 @@ async def handle_incoming_message(message: discord.Message) -> None:
     if bot.user is not None and message.author.id == bot.user.id:
         return
 
-    routes = await get_routes_for_source(message.channel.id)
+    route_channel_id = message.channel.id
+    if isinstance(message.channel, discord.Thread):
+        parent = await _forum_parent(message.channel)
+        if parent is None:
+            return
+        route_channel_id = parent.id
+        try:
+            if message.channel.me is None:
+                await message.channel.join()
+        except discord.HTTPException:
+            logger.warning("Could not join forum thread %s", message.channel.id)
+
+    routes = await get_routes_for_source(route_channel_id)
     if not routes:
         await _log_unmatched(message)
         return
@@ -146,9 +160,19 @@ async def _forward_one(message: discord.Message, route: CachedRoute) -> None:
         )
         return
 
-    channel = await _destination_channel(route.destination_channel_id)
-    reply_to = await _destination_reply(message, route, channel_map)
-    sent, attachment_errors = await _deliver(channel, cleaned_parts, list(message.attachments), embeds, reply_to)
+    if isinstance(message.channel, discord.Thread):
+        sent, attachment_errors = await _deliver_forum_message(
+            message,
+            route,
+            cleaned_parts,
+            list(message.attachments),
+            embeds,
+            channel_map,
+        )
+    else:
+        channel = await _destination_channel(route.destination_channel_id)
+        reply_to = await _destination_reply(message, route, channel_map)
+        sent, attachment_errors = await _deliver(channel, cleaned_parts, list(message.attachments), embeds, reply_to)
     if not sent:
         await write_log(
             event_type=EventType.MESSAGE_SKIPPED,
@@ -169,7 +193,7 @@ async def _forward_one(message: discord.Message, route: CachedRoute) -> None:
                     "source_message_id": str(message.id),
                     "source_channel_id": str(message.channel.id),
                     "destination_message_id": str(sent[0].id),
-                    "destination_channel_id": str(route.destination_channel_id),
+                    "destination_channel_id": str(sent[0].channel.id if isinstance(message.channel, discord.Thread) else route.destination_channel_id),
                     "destination_server_id": str(route.destination_server_id),
                 },
             )
@@ -218,6 +242,163 @@ async def _forward_one(message: discord.Message, route: CachedRoute) -> None:
         extra={"last_message_at": message.created_at.isoformat(), "last_message_id": str(message.id)},
         **_route_fields(route),
     )
+
+
+async def _deliver_forum_message(
+    message: discord.Message,
+    route: CachedRoute,
+    parts: list[str],
+    attachments: list[discord.Attachment],
+    embeds: list[discord.Embed],
+    channel_map: dict[int, int],
+) -> tuple[list[discord.Message], list[str]]:
+    """Create a destination forum post for a new thread, or send a reply into the linked post."""
+
+    source_thread = message.channel
+    if not isinstance(source_thread, discord.Thread):
+        raise RuntimeError("Forum forwarding expected a thread")
+
+    async with _lock_for(source_thread.id):
+        destination_thread = await _linked_thread(source_thread.id, route.destination_server_id)
+        if destination_thread is None:
+            forum = await _destination_channel(route.destination_channel_id)
+            if not isinstance(forum, discord.ForumChannel):
+                raise RuntimeError(f"Destination channel {route.destination_channel_id} is not a forum")
+            await _ensure_bot_can_post(forum)
+            destination_thread, sent, errors = await _open_forum_post(
+                forum,
+                source_thread.name,
+                parts,
+                attachments,
+                embeds,
+            )
+            await _save_message_link(
+                source_thread.id,
+                source_thread.id,
+                destination_thread.id,
+                destination_thread.id,
+                route.destination_server_id,
+            )
+            return sent, errors
+
+    reply_to = await _destination_reply(message, route, channel_map)
+    return await _deliver(destination_thread, parts, attachments, embeds, reply_to)
+
+
+async def _open_forum_post(
+    forum: discord.ForumChannel,
+    title: str,
+    parts: list[str],
+    attachments: list[discord.Attachment],
+    embeds: list[discord.Embed],
+) -> tuple[discord.Thread, list[discord.Message], list[str]]:
+    name = (title or "post").strip()[:100] or "post"
+    first_attachments = attachments[:_FILES_PER_MESSAGE]
+    files: list[discord.File] = []
+    paths: list[str] = []
+    errors: list[str] = []
+    try:
+        if first_attachments:
+            files, paths = await _files(first_attachments)
+        kwargs: dict = {"name": name, "allowed_mentions": _MENTIONS}
+        if parts:
+            kwargs["content"] = parts[0]
+        if files:
+            kwargs["files"] = files
+        if embeds:
+            kwargs["embeds"] = embeds[:10]
+        created = await forum.create_thread(**kwargs)
+        sent = [created.message]
+        extra_parts = parts[1:]
+        extra_attachments = attachments[_FILES_PER_MESSAGE:]
+        if extra_parts or extra_attachments:
+            more, more_errors = await _deliver(created.thread, extra_parts, extra_attachments, [], None)
+            sent.extend(more)
+            errors.extend(more_errors)
+        return created.thread, sent, errors
+    finally:
+        for path in paths:
+            if os.path.exists(path):
+                os.remove(path)
+
+
+async def _forum_parent(thread: discord.Thread) -> discord.ForumChannel | None:
+    parent = thread.parent
+    if isinstance(parent, discord.ForumChannel):
+        return parent
+    if thread.parent_id is None:
+        return None
+    try:
+        fetched = bot.get_channel(thread.parent_id) or await bot.fetch_channel(thread.parent_id)
+    except discord.HTTPException:
+        return None
+    return fetched if isinstance(fetched, discord.ForumChannel) else None
+
+
+async def _linked_thread(source_thread_id: int, destination_server_id: int) -> discord.Thread | None:
+    link = await _lookup_message_link(source_thread_id, destination_server_id, None)
+    if link is None:
+        return None
+    for key in ("destination_channel_id", "destination_message_id"):
+        try:
+            channel = await _destination_channel(int(link[key]))
+        except (TypeError, ValueError, RuntimeError, discord.HTTPException):
+            continue
+        if isinstance(channel, discord.Thread):
+            return channel
+    return None
+
+
+async def _ensure_bot_can_post(forum: discord.ForumChannel) -> None:
+    me = forum.guild.me
+    if me is None:
+        return
+    overwrite = forum.overwrites_for(me)
+    if overwrite.send_messages and overwrite.send_messages_in_threads and overwrite.create_public_threads:
+        return
+    overwrite.view_channel = True
+    overwrite.send_messages = True
+    overwrite.send_messages_in_threads = True
+    overwrite.create_public_threads = True
+    overwrite.read_message_history = True
+    try:
+        await forum.set_permissions(me, overwrite=overwrite, reason="Allow the bot to forward forum posts")
+    except discord.HTTPException:
+        logger.warning("Could not update forum permissions for the bot in %s", forum.id)
+
+
+def _lock_for(thread_id: int) -> asyncio.Lock:
+    lock = _thread_locks.get(thread_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _thread_locks[thread_id] = lock
+    return lock
+
+
+async def _save_message_link(
+    source_message_id: int,
+    source_channel_id: int,
+    destination_message_id: int,
+    destination_channel_id: int,
+    destination_server_id: int,
+) -> None:
+    try:
+        await post_json(
+            "/discord/message-links",
+            {
+                "source_message_id": str(source_message_id),
+                "source_channel_id": str(source_channel_id),
+                "destination_message_id": str(destination_message_id),
+                "destination_channel_id": str(destination_channel_id),
+                "destination_server_id": str(destination_server_id),
+            },
+        )
+    except Exception:
+        logger.exception(
+            "Could not save message link for source %s -> destination %s",
+            source_message_id,
+            destination_message_id,
+        )
 
 
 async def _destination_channel(channel_id: int) -> discord.abc.Messageable:
