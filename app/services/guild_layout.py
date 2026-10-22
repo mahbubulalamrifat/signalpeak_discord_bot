@@ -144,7 +144,7 @@ async def lock_all_member_only(guild: discord.Guild) -> dict:
 async def list_structure(guild: discord.Guild) -> dict:
     channels = await guild.fetch_channels()
     categories = [channel for channel in channels if isinstance(channel, discord.CategoryChannel)]
-    texts = [channel for channel in channels if isinstance(channel, discord.TextChannel)]
+    texts = [channel for channel in channels if isinstance(channel, (discord.TextChannel, discord.ForumChannel))]
     categories.sort(key=lambda item: item.position)
     grouped: dict[int, list[discord.TextChannel]] = {category.id: [] for category in categories}
     loose: list[discord.TextChannel] = []

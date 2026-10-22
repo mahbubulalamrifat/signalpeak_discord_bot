@@ -45,8 +45,8 @@ async def sync_destination_with_source() -> dict:
         for category in destination_channels
         if isinstance(category, discord.CategoryChannel)
     }
-    source_texts = [channel for channel in source_channels if isinstance(channel, discord.TextChannel)]
-    destination_texts = [channel for channel in destination_channels if isinstance(channel, discord.TextChannel)]
+    source_texts = _layout_channels(source_channels)
+    destination_texts = _layout_channels(destination_channels)
 
     created_categories = 0
     for key, category in source_categories.items():
@@ -74,12 +74,7 @@ async def sync_destination_with_source() -> dict:
         category = None
         if channel.category is not None:
             category = destination_categories.get(_key(channel.category.name))
-        created = await destination.create_text_channel(
-            channel.name,
-            category=category,
-            overwrites=private,
-            reason="Synced from source server",
-        )
+        created = await _create_layout_channel(destination, channel, category, private)
         destination_by_key[key] = created
         created_channels += 1
 
@@ -115,7 +110,7 @@ async def sync_destination_with_source() -> dict:
     for key, category in list(destination_categories.items()):
         if key in source_category_keys:
             continue
-        if any(isinstance(child, discord.TextChannel) for child in category.channels):
+        if any(isinstance(child, (discord.TextChannel, discord.ForumChannel)) for child in category.channels):
             continue
         try:
             await category.delete(reason="Removed while syncing with source server")
@@ -188,6 +183,29 @@ async def sync_destination_with_source() -> dict:
     )
     logger.info("Structure sync finished: %s", summary)
     return summary
+
+
+def _layout_channels(channels) -> list:
+    """Text channels and forum channels. Voice channels stay out of the layout sync."""
+
+    return [channel for channel in channels if isinstance(channel, (discord.TextChannel, discord.ForumChannel))]
+
+
+async def _create_layout_channel(guild, channel, category, overwrites):
+    if isinstance(channel, discord.ForumChannel):
+        return await guild.create_forum(
+            channel.name,
+            category=category,
+            overwrites=overwrites,
+            topic=channel.topic,
+            reason="Synced from source server",
+        )
+    return await guild.create_text_channel(
+        channel.name,
+        category=category,
+        overwrites=overwrites,
+        reason="Synced from source server",
+    )
 
 
 def _protected_channel_ids(guild: discord.Guild) -> set[int]:
