@@ -16,7 +16,7 @@ from app.services.bot_client import bot
 from app.services.image_process import manipulate_image
 from app.services.replacements import apply_replacements, rewrite_channel_mentions
 from app.services.replace_cache import get_replace_rules
-from app.services.route_cache import CachedRoute, get_channel_map, get_routes_for_source, tracked_server_ids
+from app.services.route_cache import CachedRoute, all_routes, get_channel_map, get_routes_for_source, tracked_server_ids
 from app.services.signalpeak_api import get_json, patch_json, post_json
 from app.services.text import split_discord_content
 
@@ -373,6 +373,153 @@ def _lock_for(thread_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _thread_locks[thread_id] = lock
     return lock
+
+
+async def copy_existing_forum_posts() -> dict:
+    """Copy forum posts that already exist on the source into the paired destination forum."""
+
+    copied_threads = 0
+    copied_messages = 0
+    skipped_threads = 0
+    failed_threads = 0
+    for route in await all_routes():
+        try:
+            source = await _destination_channel(route.source_channel_id)
+            destination = await _destination_channel(route.destination_channel_id)
+        except (RuntimeError, discord.HTTPException):
+            logger.exception("Could not open forum pair %s", route.id)
+            continue
+        if not isinstance(source, discord.ForumChannel) or not isinstance(destination, discord.ForumChannel):
+            continue
+        await _ensure_bot_can_post(destination)
+        try:
+            threads = await _forum_threads(source)
+        except discord.HTTPException:
+            logger.exception("Could not list posts in forum %s", source.id)
+            failed_threads += 1
+            continue
+        logger.info("Copying %s existing post(s) from #%s", len(threads), source.name)
+        for thread in threads:
+            try:
+                created, messages = await _copy_forum_thread(thread, destination, route)
+            except Exception:
+                logger.exception("Could not copy forum post %s (%s)", thread.id, thread.name)
+                failed_threads += 1
+                continue
+            if created:
+                copied_threads += 1
+            else:
+                skipped_threads += 1
+            copied_messages += messages
+    summary = {
+        "threads": copied_threads,
+        "messages": copied_messages,
+        "skipped_threads": skipped_threads,
+        "failed_threads": failed_threads,
+    }
+    logger.info("Forum history copy finished: %s", summary)
+    return summary
+
+
+async def _forum_threads(forum: discord.ForumChannel) -> list[discord.Thread]:
+    found: dict[int, discord.Thread] = {}
+    try:
+        payload = await bot.http.get_active_threads(forum.guild.id)
+    except discord.HTTPException:
+        logger.exception("Could not list active threads in %s", forum.guild.id)
+        payload = {}
+    for raw in payload.get("threads", []):
+        if str(raw.get("parent_id") or "") != str(forum.id):
+            continue
+        thread = discord.Thread(guild=forum.guild, state=forum._state, data=raw)
+        found[thread.id] = thread
+    async for thread in forum.archived_threads(limit=None):
+        found[thread.id] = thread
+    return sorted(found.values(), key=lambda item: item.id)
+
+
+async def _copy_forum_thread(
+    source_thread: discord.Thread,
+    forum: discord.ForumChannel,
+    route: CachedRoute,
+) -> tuple[bool, int]:
+    """Copy one source post. Returns whether this call created it, and how many messages were sent."""
+
+    messages = [
+        message
+        async for message in source_thread.history(limit=None, oldest_first=True)
+        if bot.user is None or message.author.id != bot.user.id
+    ]
+    messages = [message for message in messages if message.content or message.attachments or message.embeds]
+    if not messages:
+        return False, 0
+
+    created = False
+    sent_count = 0
+    async with _lock_for(source_thread.id):
+        destination_thread = await _linked_thread(source_thread.id, route.destination_server_id)
+        pending = []
+        for message in messages:
+            if await _lookup_message_link(message.id, route.destination_server_id, None):
+                continue
+            pending.append(message)
+        if destination_thread is None:
+            if not pending:
+                return False, 0
+            first = pending.pop(0)
+            parts, embeds = await _prepared_message(first, route)
+            if not parts and not first.attachments and not embeds:
+                parts = [source_thread.name[:2000]]
+            destination_thread, sent, _errors = await _open_forum_post(
+                forum,
+                source_thread.name,
+                parts,
+                list(first.attachments),
+                embeds,
+            )
+            await _save_message_link(
+                source_thread.id,
+                source_thread.id,
+                destination_thread.id,
+                destination_thread.id,
+                route.destination_server_id,
+            )
+            if first.id != source_thread.id and sent:
+                await _save_message_link(
+                    first.id,
+                    source_thread.id,
+                    sent[0].id,
+                    destination_thread.id,
+                    route.destination_server_id,
+                )
+            created = True
+            sent_count += len(sent)
+        elif not pending:
+            return False, 0
+
+        for message in pending:
+            parts, embeds = await _prepared_message(message, route)
+            if not parts and not message.attachments and not embeds:
+                continue
+            sent, _errors = await _deliver(destination_thread, parts, list(message.attachments), embeds, None)
+            if not sent:
+                continue
+            await _save_message_link(
+                message.id,
+                source_thread.id,
+                sent[0].id,
+                destination_thread.id,
+                route.destination_server_id,
+            )
+            sent_count += len(sent)
+    return created, sent_count
+
+
+async def _prepared_message(message: discord.Message, route: CachedRoute) -> tuple[list[str], list[discord.Embed]]:
+    rules = list(await get_replace_rules())
+    channel_map = await get_channel_map(route.destination_server_id)
+    replaced = apply_replacements(rewrite_channel_mentions(message.content or "", channel_map), rules)
+    return split_discord_content(replaced.text), _copy_embeds(message, channel_map)
 
 
 async def _save_message_link(

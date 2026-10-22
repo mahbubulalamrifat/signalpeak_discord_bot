@@ -151,6 +151,9 @@ async def sync_destination_with_source() -> dict:
     }
     result = await post_json("/discord/routes/replace", routes_payload)
     await refresh_route_cache()
+    from app.services.forwarder import copy_existing_forum_posts
+
+    forum_posts = await copy_existing_forum_posts()
 
     summary = {
         "created_categories": created_categories,
@@ -159,6 +162,8 @@ async def sync_destination_with_source() -> dict:
         "deleted_channels": deleted_channels,
         "skipped_channels": skipped_channels,
         "routes": result.get("created", len(pairs)),
+        "forum_threads": forum_posts["threads"],
+        "forum_messages": forum_posts["messages"],
         "source_only": len(missing_destination),
         "destination_only": len(missing_source),
         "server_id": str(destination.id),
@@ -171,7 +176,8 @@ async def sync_destination_with_source() -> dict:
             f"+{created_categories} categories, +{created_channels} channels, "
             f"-{deleted_categories} categories, -{deleted_channels} channels, "
             f"{skipped_channels} community channel(s) left in place, "
-            f"{summary['routes']} route pair(s)."
+            f"{summary['routes']} route pair(s), "
+            f"{forum_posts['threads']} forum post(s), {forum_posts['messages']} forum message(s)."
         ),
         source_server_id=source.id,
         source_server_name=source.name,
