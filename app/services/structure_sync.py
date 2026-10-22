@@ -84,11 +84,24 @@ async def sync_destination_with_source() -> dict:
         created_channels += 1
 
     deleted_channels = 0
+    skipped_channels = 0
+    protected_ids = _protected_channel_ids(destination)
     for channel in list(destination_texts):
         key = channel_match_key(_category_name(channel), channel.name)
         if key in source_keys:
             continue
-        await channel.delete(reason="Removed while syncing with source server")
+        if channel.id in protected_ids:
+            skipped_channels += 1
+            logger.info("Left community-required channel #%s in place", channel.name)
+            continue
+        try:
+            await channel.delete(reason="Removed while syncing with source server")
+        except discord.HTTPException as exc:
+            if getattr(exc, "code", None) != 50074:
+                raise
+            skipped_channels += 1
+            logger.warning("Discord refused to delete #%s: %s", channel.name, exc)
+            continue
         deleted_channels += 1
 
     destination_channels = await destination.fetch_channels()
@@ -104,7 +117,13 @@ async def sync_destination_with_source() -> dict:
             continue
         if any(isinstance(child, discord.TextChannel) for child in category.channels):
             continue
-        await category.delete(reason="Removed while syncing with source server")
+        try:
+            await category.delete(reason="Removed while syncing with source server")
+        except discord.HTTPException as exc:
+            if getattr(exc, "code", None) != 50074:
+                raise
+            logger.warning("Discord refused to delete category %s: %s", category.name, exc)
+            continue
         deleted_categories += 1
         del destination_categories[key]
 
@@ -145,6 +164,7 @@ async def sync_destination_with_source() -> dict:
         "created_channels": created_channels,
         "deleted_categories": deleted_categories,
         "deleted_channels": deleted_channels,
+        "skipped_channels": skipped_channels,
         "routes": result.get("created", len(pairs)),
         "source_only": len(missing_destination),
         "destination_only": len(missing_source),
@@ -157,6 +177,7 @@ async def sync_destination_with_source() -> dict:
             f"Synced destination {destination.name} with source {source.name}: "
             f"+{created_categories} categories, +{created_channels} channels, "
             f"-{deleted_categories} categories, -{deleted_channels} channels, "
+            f"{skipped_channels} community channel(s) left in place, "
             f"{summary['routes']} route pair(s)."
         ),
         source_server_id=source.id,
@@ -167,6 +188,16 @@ async def sync_destination_with_source() -> dict:
     )
     logger.info("Structure sync finished: %s", summary)
     return summary
+
+
+def _protected_channel_ids(guild: discord.Guild) -> set[int]:
+    """Rules and public-updates channels cannot be deleted on a community server."""
+
+    ids: set[int] = set()
+    for channel in (guild.rules_channel, guild.public_updates_channel):
+        if channel is not None:
+            ids.add(channel.id)
+    return ids
 
 
 def _key(name: str) -> str:
